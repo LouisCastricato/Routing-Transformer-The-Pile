@@ -47,7 +47,7 @@ def add_argument():
 
 # constants
 
-VALIDATE_EVERY  = 1000
+VALIDATE_EVERY  = 100
 GENERATE_EVERY  = 5000
 GENERATE_LENGTH = 256
 SEQ_LEN = 4096
@@ -64,17 +64,19 @@ def decode_tokens(tokens):
 
 model = RoutingTransformerLM(
     num_tokens = tokenizer.vocab_size,
-    dim = 512,
-    depth = 8,
+    dim = 256,
+    depth = 16,
     max_seq_len = SEQ_LEN,
     heads = 8,
     causal = True,
     window_size = 512,
+    local_attn_window_size = 512,
     reversible = True,
     ff_chunks = 2,
+    ff_glu = True,
     attn_dropout = 0.1,
     rel_pos_emb = False,
-    n_local_attn_heads = (8,8,8,8,8,8,6,6)
+    n_local_attn_heads = (8,8,8,8,8,8,8,8,8,8,8,8,8,8,6,6)
 )
 
 model = AutoregressiveWrapper(model)
@@ -168,10 +170,12 @@ for i, (data, mask) in tqdm(enumerate(trainloader)):
         val_dataset = dataset.get_val()
         val_indx = 0
         with torch.no_grad():
-            val_indx, (inp, _) = random.choice(list(enumerate(val_dataset)))
-            loss = model(inp[None, :].cuda(), return_loss = True)
-            print(f'validation loss: {loss.item()}')
-        dataset.val_list[val_indx] = dataset.read()
+
+            loss_sample = 0
+            for inp,_ in val_dataset[0:15]:
+                loss_sample += model(inp[None, :].cuda(), return_loss = True)
+
+            print(f'validation loss: {loss_sample.item()}')
 
     torch.distributed.barrier()    
     if i != 0 and ((i % GENERATE_EVERY) == 0) and model_engine.local_rank == 0:
