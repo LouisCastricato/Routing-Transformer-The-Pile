@@ -19,6 +19,8 @@ import torch.nn.functional as F
 from tqdm import tqdm
 import pickle
 import os
+import shutil
+import time
 #from utils import save_checkpoint
 #from utils import load_checkpoint
 
@@ -46,7 +48,7 @@ def add_argument():
 # constants
 
 VALIDATE_EVERY  = 1000
-GENERATE_EVERY  = 1
+GENERATE_EVERY  = 5000
 GENERATE_LENGTH = 256
 SEQ_LEN = 4096
 
@@ -67,7 +69,7 @@ model = RoutingTransformerLM(
     max_seq_len = SEQ_LEN,
     heads = 8,
     causal = True,
-    window_size = 128,
+    window_size = 512,
     reversible = True,
     ff_chunks = 2,
     attn_dropout = 0.1,
@@ -138,11 +140,20 @@ dataset = TextSamplerDataset("/media/ambient/LargeDatasetsSSD/pile/The-Pile/pile
 cmd_args = add_argument()
 model_engine, optimizer, trainloader, _ = deepspeed.initialize(args=cmd_args, model=model, model_parameters=model.parameters(),  training_data=dataset)
 
+# try:
+#     shutil.rmtree('models')
+# except:
+#     pass
 # training
 if cmd_args.chckpt is not -1:
-    checkpoint = load("models/"+ str(cmd_args.chckpt) + "/"+"model.pt")
+    checkpoint = load("/models/{}-model.pt".format(cmd_args.chckpt)) #load("models/"+ str(cmd_args.chckpt) + "/"+"model.pt")
     model.load_state_dict(checkpoint['model_state_dict'])
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
     dataset.resume(checkpoint['doc_pos'])
+#print(trainloader)
+#for _ in trainloader:
+#    print("Hi")
+
 for i, (data, mask) in tqdm(enumerate(trainloader)):
     model_engine.train()
 
@@ -162,31 +173,39 @@ for i, (data, mask) in tqdm(enumerate(trainloader)):
             print(f'validation loss: {loss.item()}')
         dataset.val_list[val_indx] = dataset.read()
 
-    if i != 0 and model_engine.local_rank == 0 and i % GENERATE_EVERY == 0:
-        path = "models/"+str(i) + "/"
+    torch.distributed.barrier()    
+    if i != 0 and ((i % GENERATE_EVERY) == 0) and model_engine.local_rank == 0:
+        #print(i)
+        # path = "./models/"+str(i) + "/"
+
         try:
-            os.mkdir(path)
+        	os.mkdir(models)
         except:
-            #Dir already exists. Overwrite the file
-            pass
+        	pass
+
         torch.save({
             'iteration': i,
             'model_state_dict' : model.state_dict(),
             'optimizer_state_dict' : optimizer.state_dict(),
             'doc_pos' : dataset.state
-        }, path+"model.pt")
-        model_engine.save_checkpoint(path, "deepspeed")
+        }, "models/{}-model.pt".format(i))
+        #model_engine.save_checkpoint("./", "deepspeed")
 
         #pickle.dump(optimizer, open(path+"optimizer.pkl", "wb"))
 
+        #print('donesave')
+        #import sys
+        #sys.exit()
         model.eval()
         val_dataset = dataset.get_val()
-        inp, _ = random.choice(val_dataset)
-        prime = tokenizer.decode(inp)
-        print(f'%s \n\n %s', (prime, '*' * 100))
+        with torch.no_grad():
+            inp, _ = random.choice(val_dataset)
+            #print('huh')
+            prime = tokenizer.decode(inp)
+            print(f'%s \n\n %s', (prime, '*' * 100))
 
-        sample = model.generate(inp.cuda(), GENERATE_LENGTH)
-        output_str = tokenizer.decode(sample)
-        print(output_str)
-
-
+            sample = model.generate(inp.cuda(), GENERATE_LENGTH)
+            output_str = tokenizer.decode(sample)
+            print(output_str)
+    
+    torch.distributed.barrier()    
