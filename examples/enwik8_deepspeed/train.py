@@ -9,6 +9,7 @@ import tqdm
 import gzip
 import numpy as np
 import torch
+from torch import load
 import torch.optim as optim
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset
@@ -45,7 +46,7 @@ def add_argument():
 # constants
 
 VALIDATE_EVERY  = 1000
-GENERATE_EVERY  = 5000
+GENERATE_EVERY  = 1
 GENERATE_LENGTH = 256
 SEQ_LEN = 4096
 
@@ -139,9 +140,8 @@ model_engine, optimizer, trainloader, _ = deepspeed.initialize(args=cmd_args, mo
 
 # training
 if cmd_args.chckpt is not -1:
-    checkpoint = torch.load("models/"+ str(cmd_args.load) + "/"+"model.pt")
+    checkpoint = load("models/"+ str(cmd_args.chckpt) + "/"+"model.pt")
     model.load_state_dict(checkpoint['model_state_dict'])
-    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
     dataset.resume(checkpoint['doc_pos'])
 for i, (data, mask) in tqdm(enumerate(trainloader)):
     model_engine.train()
@@ -162,7 +162,6 @@ for i, (data, mask) in tqdm(enumerate(trainloader)):
             print(f'validation loss: {loss.item()}')
         dataset.val_list[val_indx] = dataset.read()
 
-    torch.distributed.barrier()
     if i != 0 and model_engine.local_rank == 0 and i % GENERATE_EVERY == 0:
         path = "models/"+str(i) + "/"
         try:
@@ -176,8 +175,9 @@ for i, (data, mask) in tqdm(enumerate(trainloader)):
             'optimizer_state_dict' : optimizer.state_dict(),
             'doc_pos' : dataset.state
         }, path+"model.pt")
-        torch.distributed.barrier()
+        model_engine.save_checkpoint(path, "deepspeed")
 
+        #pickle.dump(optimizer, open(path+"optimizer.pkl", "wb"))
 
         model.eval()
         val_dataset = dataset.get_val()
