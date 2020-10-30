@@ -47,10 +47,12 @@ def add_argument():
 
 # constants
 
-VALIDATE_EVERY  = 100
-GENERATE_EVERY  = 5000
+VALIDATE_EVERY  = 500
+VALIDATE_SIZE = 50
+GENERATE_EVERY  = 10000
+SAVE_EVERY = 2500
 GENERATE_LENGTH = 256
-SEQ_LEN = 4096
+SEQ_LEN = 2048
 
 # helpers
 
@@ -64,19 +66,24 @@ def decode_tokens(tokens):
 
 model = RoutingTransformerLM(
     num_tokens = tokenizer.vocab_size,
-    dim = 256,
-    depth = 16,
+    dim = 768,
+    depth = 12,
     max_seq_len = SEQ_LEN,
-    heads = 8,
+    heads = 12,
     causal = True,
-    window_size = 512,
+    window_size = 256,
     local_attn_window_size = 512,
-    reversible = True,
+    reversible = False,
     ff_chunks = 2,
     ff_glu = True,
-    attn_dropout = 0.1,
+    attn_dropout = 0.0,
     rel_pos_emb = False,
-    n_local_attn_heads = (8,8,8,8,8,8,8,8,8,8,8,8,8,8,6,6)
+    n_local_attn_heads = (12,12,12,12,12,12,12,12,12,12,12,12),
+    _register_kmeans_update = False,
+    tie_embedding = True,
+    use_absolute_pos_emb = True,
+    kmeans_ema_decay = 0.9999,
+    commitment_factor = 1e-5,
 )
 
 model = AutoregressiveWrapper(model)
@@ -100,7 +107,7 @@ class TextSamplerDataset(Dataset):
     #Read the next element from stream
     def read(self):
         text = next(self.docs)
-        tok = tokenizer(text, return_tensors='pt')['input_ids']
+        tok = tokenizer(text, return_tensors='pt')['input_ids'].long()
         mask = torch.ones_like(tok).bool()
 
         if tok.size(1) >= SEQ_LEN:
@@ -110,7 +117,7 @@ class TextSamplerDataset(Dataset):
             tok = F.pad(tok, pad=(0, SEQ_LEN - tok.size(1)), mode='constant', value=0)
             mask = F.pad(mask, pad=(0, SEQ_LEN - mask.size(1)), mode='constant', value=0)
 
-        if len(self.val_list) <= 50:
+        if len(self.val_list) <= VALIDATE_SIZE:
             self.val_list.append((tok.squeeze(), mask.squeeze()))
             return self.read()
 
@@ -126,7 +133,8 @@ class TextSamplerDataset(Dataset):
                     self.cache_dict[i] = True
 
         return self.cache[true_i]
-
+    def fill_val(self):
+        self.read()
     def __len__(self):
         return int(202952221 * 0.98)
     def get_val(self):
@@ -142,57 +150,53 @@ dataset = TextSamplerDataset("/media/ambient/LargeDatasetsSSD/pile/The-Pile/pile
 cmd_args = add_argument()
 model_engine, optimizer, trainloader, _ = deepspeed.initialize(args=cmd_args, model=model, model_parameters=model.parameters(),  training_data=dataset)
 
-# try:
-#     shutil.rmtree('models')
-# except:
-#     pass
-# training
+s = 0
 if cmd_args.chckpt is not -1:
-    checkpoint = load("/models/{}-model.pt".format(cmd_args.chckpt)) #load("models/"+ str(cmd_args.chckpt) + "/"+"model.pt")
-    model.load_state_dict(checkpoint['model_state_dict'])
-    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-    dataset.resume(checkpoint['doc_pos'])
-#print(trainloader)
-#for _ in trainloader:
-#    print("Hi")
+    model_engine.load_checkpoint("models/", str(cmd_args.chckpt))
+    dataset.resume(cmd_args.chckpt + 1)
+    s = cmd_args.chckpt + 1
 
-for i, (data, mask) in tqdm(enumerate(trainloader)):
+for i, (data, mask) in tqdm(enumerate(trainloader, start=s), initial=s):
     model_engine.train()
 
     data = data.to(model_engine.local_rank)
     loss = model_engine(data, return_loss = True, randomly_truncate_sequence = True)
     model_engine.backward(loss)
+    check = model_engine.is_gradient_accumulation_boundary()
     model_engine.step()
-    #print(loss.item())
-
-    if (i+1) % VALIDATE_EVERY == 0 and model_engine.local_rank == 0:
-        model.eval()
+    if check:
+        model.base_net.update_kmeans()
+    if (i+1) % VALIDATE_EVERY == 0:
         val_dataset = dataset.get_val()
+        torch.distributed.barrier()
+        dataset.clear_val()
+        dataset.read()
+
+    if (i+1) % VALIDATE_EVERY == 0 and model_engine.local_rank==0:
+        model.eval()
         val_indx = 0
+        print(loss)
         with torch.no_grad():
 
             loss_sample = 0
-            for inp,_ in val_dataset[0:15]:
+            for inp,_ in val_dataset:
                 loss_sample += model(inp[None, :].cuda(), return_loss = True)
-
-            print(f'validation loss: {loss_sample.item()}')
-
-    torch.distributed.barrier()    
-    if i != 0 and ((i % GENERATE_EVERY) == 0) and model_engine.local_rank == 0:
+            loss_s = loss_sample.item() / float(len(val_dataset))
+            print(f'validation loss: {loss_s}')
+    
+    if i != 0 and ((i % SAVE_EVERY) == 0):
+        torch.distributed.barrier()
         #print(i)
         # path = "./models/"+str(i) + "/"
 
         try:
-        	os.mkdir(models)
+        	os.mkdir("models")
         except:
         	pass
+        model_engine.save_checkpoint("models/", str(i))
 
-        torch.save({
-            'iteration': i,
-            'model_state_dict' : model.state_dict(),
-            'optimizer_state_dict' : optimizer.state_dict(),
-            'doc_pos' : dataset.state
-        }, "models/{}-model.pt".format(i))
+
+    if i != 0 and ((i % GENERATE_EVERY) == 0) and model_engine.local_rank == 0:
         #model_engine.save_checkpoint("./", "deepspeed")
 
         #pickle.dump(optimizer, open(path+"optimizer.pkl", "wb"))
@@ -211,5 +215,4 @@ for i, (data, mask) in tqdm(enumerate(trainloader)):
             sample = model.generate(inp.cuda(), GENERATE_LENGTH)
             output_str = tokenizer.decode(sample)
             print(output_str)
-    
-    torch.distributed.barrier()    
+    torch.distributed.barrier()
