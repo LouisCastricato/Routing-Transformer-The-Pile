@@ -52,8 +52,8 @@ VALIDATE_SIZE = 50
 GENERATE_EVERY  = 10000
 SAVE_EVERY = 2500
 GENERATE_LENGTH = 256
-SEQ_LEN = 2048
-
+SEQ_LEN = 1024
+CACHE_SIZE = 2500
 # helpers
 
 def decode_token(token):
@@ -67,7 +67,7 @@ def decode_tokens(tokens):
 model = RoutingTransformerLM(
     num_tokens = tokenizer.vocab_size,
     dim = 768,
-    depth = 12,
+    depth = 15,
     max_seq_len = SEQ_LEN,
     heads = 12,
     causal = True,
@@ -76,9 +76,9 @@ model = RoutingTransformerLM(
     reversible = False,
     ff_chunks = 2,
     ff_glu = True,
-    attn_dropout = 0.0,
+    ff_dropout = 0.1,
     rel_pos_emb = False,
-    n_local_attn_heads = (12,12,12,12,12,12,12,12,12,12,12,12),
+    n_local_attn_heads = (12,12,12,12,12,12,12,12,12,12,12,12,12,10,10),
     _register_kmeans_update = False,
     tie_embedding = True,
     use_absolute_pos_emb = True,
@@ -90,24 +90,31 @@ model = AutoregressiveWrapper(model)
 model.cuda()
 
 class TextSamplerDataset(Dataset):
-    def __init__(self, directory, cache_size = 100):
+    def __init__(self, directory, cache_size = CACHE_SIZE):
         super().__init__()
         self.c = cache_size
         self.indx = 0
         #Some magic. Dynamic shuffling and caching
-        self.cache_dict =   [True] * self.c
-        self.cache = [None] * self.c
-        self.docs = lmd.Reader(directory).stream_data()
+        self.cache = list()
+        self.reader = lmd.Reader(directory)
+        self.docs = self.reader.stream_data()
         self.val_list = list()
         self.state = 0
         #Preload the first k elements
-        for i in range(self.c):
-            self.cache[i] = self.read()
+        for _ in range(self.c):
+            self.read(False)
 
     #Read the next element from stream
-    def read(self):
-        text = next(self.docs)
+    def read(self, ret = True):
+        try:
+            text = next(self.docs)
+        except:
+            print(self.reader.f)
         tok = tokenizer(text, return_tensors='pt')['input_ids'].long()
+        length = tok.size(1)
+        rnd_length = random.randint(min(SEQ_LEN, length), length)
+        rnd_shift = random.randint(0, length - rnd_length)
+        tok = tok[0:, (rnd_shift):(rnd_shift+rnd_length)]
         mask = torch.ones_like(tok).bool()
 
         if tok.size(1) >= SEQ_LEN:
@@ -118,21 +125,21 @@ class TextSamplerDataset(Dataset):
             mask = F.pad(mask, pad=(0, SEQ_LEN - mask.size(1)), mode='constant', value=0)
 
         if len(self.val_list) <= VALIDATE_SIZE:
-            self.val_list.append((tok.squeeze(), mask.squeeze()))
+            self.val_list.append((tok, mask))
             return self.read()
-
+        
+        self.cache.append((tok, mask))
+        if self.state % self.c+1 == 0 and self.state!=0:
+            self.state = 0
+            c = list(zip(self.cache, self.cache_dict))
+            random.shuffle(c)
+            self.cache, self.cache_dict = zip(*c)
+            
         self.state += 1
-        return tok.squeeze(), mask.squeeze()
+        if ret:
+            return self.cache.pop(0)
     def __getitem__(self, index): 
-        true_i = index % self.c
-        #If our current element is missing, look at all prior ones and fill to this point.
-        if not self.cache_dict[true_i]:
-            for i,b in enumerate(self.cache_dict[0:true_i + 1]):
-                if not b:
-                    self.cache[i] = self.read()
-                    self.cache_dict[i] = True
-
-        return self.cache[true_i]
+        return self.read()
     def fill_val(self):
         self.read()
     def __len__(self):
@@ -143,20 +150,22 @@ class TextSamplerDataset(Dataset):
         self.val_list  = list()
     def resume(self, new_state):
         for _ in range(new_state): next(self.docs)
-dataset = TextSamplerDataset("/media/ambient/LargeDatasetsSSD/pile/The-Pile/pile_output/")
 
 # setup deepspeed
 
 cmd_args = add_argument()
-model_engine, optimizer, trainloader, _ = deepspeed.initialize(args=cmd_args, model=model, model_parameters=model.parameters(),  training_data=dataset)
+directory = "/media/ambient/LargeDatasetsSSD/pile/The-Pile/pile_output/"+ "t" + str(cmd_args.local_rank + 1) + "/"
+print("******\nReading from:\n"+directory+"\n******\n")
+dataset = TextSamplerDataset(directory)
+model_engine, optimizer, trainloader, _ = deepspeed.initialize(args=cmd_args, model=model, model_parameters=model.parameters())
 
 s = 0
 if cmd_args.chckpt is not -1:
     model_engine.load_checkpoint("models/", str(cmd_args.chckpt))
-    dataset.resume(cmd_args.chckpt + 1)
+    dataset.resume(cmd_args.chckpt)
     s = cmd_args.chckpt + 1
 
-for i, (data, mask) in tqdm(enumerate(trainloader, start=s), initial=s):
+for i, (data, mask) in tqdm(enumerate(dataset, start=s), initial=s):
     model_engine.train()
 
     data = data.to(model_engine.local_rank)
@@ -180,6 +189,7 @@ for i, (data, mask) in tqdm(enumerate(trainloader, start=s), initial=s):
 
             loss_sample = 0
             for inp,_ in val_dataset:
+                inp = inp.squeeze()
                 loss_sample += model(inp[None, :].cuda(), return_loss = True)
             loss_s = loss_sample.item() / float(len(val_dataset))
             print(f'validation loss: {loss_s}')
@@ -208,6 +218,7 @@ for i, (data, mask) in tqdm(enumerate(trainloader, start=s), initial=s):
         val_dataset = dataset.get_val()
         with torch.no_grad():
             inp, _ = random.choice(val_dataset)
+            inp = inp.squeeze()
             #print('huh')
             prime = tokenizer.decode(inp)
             print(f'%s \n\n %s', (prime, '*' * 100))
